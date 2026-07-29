@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **statusLine plugins (e.g. claude-hud) no longer suppress auto-continue.** A plugin
+  that renders its own rows under the input box (model badge, context percentage, git
+  ahead/behind, session timer, todos ratio, divider) put non-built-in furniture in the
+  same live region as Claude Code's rate-limit banner. Those rows weren't in the chrome
+  allowlist, so they consumed the content-tail budget and buried a real `resets …` banner
+  below the detection window — the reset time was never read and no retry was scheduled.
+  They could also false-match the limit patterns (`⚠ Limit`, a usage percentage). The
+  chrome allowlist now recognizes these statusLine rows, so detection works the same with
+  or without a statusLine plugin installed.
+- **Interactive `/rate-limit-options` menu no longer waits the wrong (5h fallback) time
+  when a statusLine plugin carried the reset time.** The menu replaces the statusLine
+  region, so once it opens a banner whose reset time was shown by claude-hud (`Usage ⚠
+  Limit reached (resets in 2h)`) — and sometimes Claude Code's own banner — is gone from
+  the capture, and the menu text carries no parseable reset time. The menu path then fell
+  back to `fallbackWaitHours` (5h), so a 2h limit was mis-waited as ~5h and the
+  auto-continue fired hours late (observed in the logs as "Waiting 18060s"). The menu path
+  now reuses a reset time a prior monitoring tick successfully parsed and cached (decayed
+  by the elapsed time), only falling back to `fallbackWaitHours` when no cached reset
+  exists.
+
 ## [0.6.1] - 2026-07-23
 
 ### Fixed

@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { createMonitorState, processOneTick } from '../src/monitor.js';
+import { createMonitorState, processOneTick, resetWaitFromCache } from '../src/monitor.js';
 import { DEFAULT_CONFIG } from '../src/config.js';
 
 function mockTmux(paneContent = '', paneCommand = 'node', claudeForeground = true) {
@@ -93,6 +93,95 @@ describe('processOneTick', () => {
     assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'menu-unreadable');
     assert.equal(t._keys.length, 0);            // pressed nothing
     assert.equal(t._sent.length, 0);
+  });
+
+  // --- statusLine plugin / menu hides the banner: reuse a cached reset time ---
+  //   The /rate-limit-options menu replaces the statusLine region, so a banner whose
+  //   reset time was carried by claude-hud ("Usage ⚠ Limit reached (resets in 2h)") is
+  //   gone from the capture once the menu is up. Without the cache the menu path fell
+  //   back to fallbackWaitHours (5h) — observed live as "Waiting 18060s" for a 2h limit.
+  describe('menu path reuses a cached reset time when the banner is hidden', () => {
+    // A menu with NO reset time in it (the banner/statusLine was replaced by the menu).
+    const MENU_NO_RESET = [
+      'What do you want to do?',
+      '❯ 1. Upgrade your plan',
+      '  2. Stop and wait for limit to reset',
+      'Enter to confirm · Esc to cancel',
+    ].join('\n');
+
+    it('uses the cached reset wait (decayed by elapsed time), not the 5h fallback', async () => {
+      const s = createMonitorState();
+      // Simulate a prior monitoring tick that parsed "resets in 2h" (7200000ms) a minute ago.
+      s.lastResetWaitMs = 7200_000;
+      s.lastResetCachedAt = Date.now() - 60_000;
+      const t = mockTmux(MENU_NO_RESET);
+      const before = Date.now();
+      assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'menu-confirmed');
+      const waitSec = Math.round((s.waitUntil - before) / 1000);
+      // 2h minus 1min elapsed ≈ 7140s. Must be the ~2h cache, NOT the 18060s fallback.
+      assert.ok(waitSec > 7000 && waitSec < 7200,
+        `expected ~7140s from cache, got ${waitSec}s (fallback would be ~18060)`);
+    });
+
+    it('falls back to fallbackWaitHours when no cache exists', async () => {
+      const s = createMonitorState();             // no prior parse → no cache
+      const t = mockTmux(MENU_NO_RESET);
+      const before = Date.now();
+      assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'menu-confirmed');
+      const waitSec = Math.round((s.waitUntil - before) / 1000);
+      assert.ok(waitSec >= 18000 && waitSec <= 18100,
+        `expected ~18060s fallback, got ${waitSec}s`);
+    });
+
+    it('does not park the session when the cached reset has already expired', async () => {
+      const s = createMonitorState();
+      // The cached 2h reset was seen 3h ago — the limit has cleared; wait just the margin.
+      s.lastResetWaitMs = 7200_000;
+      s.lastResetCachedAt = Date.now() - 10800_000;
+      const t = mockTmux(MENU_NO_RESET);
+      const before = Date.now();
+      await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true);
+      const waitSec = Math.round((s.waitUntil - before) / 1000);
+      assert.ok(waitSec < 120,
+        `expected a short margin wait (limit cleared), got ${waitSec}s`);
+    });
+
+    it('still parses the reset time when the banner IS in the menu capture', async () => {
+      // Regression guard: MENU_UPGRADE_FIRST carries "resets 6:50pm" above the menu.
+      const s = createMonitorState();
+      s.lastResetWaitMs = 3600_000;               // a stale cache that must NOT win
+      s.lastResetCachedAt = Date.now() - 1000;
+      const t = mockTmux(MENU_UPGRADE_FIRST);
+      await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true);
+      // A fresh parse refreshes the cache with the new wait (not the stale 1h value).
+      assert.ok(s.lastResetWaitMs !== 3600_000 || s.lastResetCachedAt > Date.now() - 5000);
+      assert.ok(s.lastResetWaitMs > 0);
+    });
+  });
+
+  describe('resetWaitFromCache', () => {
+    const cfg = DEFAULT_CONFIG;
+    const fb = (cfg.fallbackWaitHours * 3600 + cfg.marginSeconds) * 1000;
+
+    it('returns the fallback when no cache exists', () => {
+      const s = createMonitorState();
+      assert.equal(resetWaitFromCache(s, cfg), fb);
+    });
+    it('returns the decayed remaining wait within the window', () => {
+      const s = createMonitorState();
+      s.lastResetWaitMs = 7200_000;
+      s.lastResetCachedAt = 1000;
+      // 1h elapsed of a 2h wait → ~1h remaining.
+      const got = resetWaitFromCache(s, cfg, 1000 + 3600_000);
+      assert.ok(got > 3500_000 && got < 3700_000, `got ${got}`);
+    });
+    it('returns just the margin when the cached reset already passed', () => {
+      const s = createMonitorState();
+      s.lastResetWaitMs = 3600_000;
+      s.lastResetCachedAt = 1000;
+      // 2h elapsed of a 1h wait → limit cleared.
+      assert.equal(resetWaitFromCache(s, cfg, 1000 + 7200_000), cfg.marginSeconds * 1000);
+    });
   });
   it('exits when PID dead', async () => {
     const t = mockTmux('5-hour limit reached - resets 3pm (UTC)');

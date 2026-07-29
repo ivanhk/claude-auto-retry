@@ -143,6 +143,14 @@ registers even when a tall task list or background-agent status pushes it well a
 prompt, while a banner merely *quoted* in scrollback (with real output below it) does not
 trigger a retry.
 
+It also recognizes **statusLine plugins** (such as
+[claude-hud](https://github.com/jarrodwatts/claude-hud)) that render their own rows under
+the input box. Those rows are not Claude Code's built-in furniture; left unstripped they
+bury a real `resets …` banner below the detection window (so the auto-continue never
+fires) and their own usage text (`⚠ Limit`, a context percentage) can false-match a limit.
+The plugin rows are now stripped as chrome too, so detection works the same with or
+without a statusLine plugin installed.
+
 Your own `customPatterns` are the exception: they are matched against the **raw** last-N
 lines (not the chrome-skipped view), so a pattern keyed on footer text — a usage
 percentage, a model name — keeps firing. You own the false-positive tradeoff for your

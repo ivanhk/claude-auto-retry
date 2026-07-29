@@ -91,6 +91,24 @@ const CHROME_LINE = [
   /Backgrounded agent \(|to manage · /i,             // background-agent notice — the "(" (or "to manage ·")
                                                      // is required so prose ("Backgrounded agent finished
                                                      // the lint run") isn't stripped
+  // --- statusLine plugins (claude-hud, jarrodwatts/claude-hud, and similar) ---
+  // These render a multi-row statusLine directly under the input box — the SAME live
+  // region Claude Code's own rate-limit banner + footer occupy. Their rows are NOT
+  // Claude Code's built-in furniture, so the patterns above don't strip them: they
+  // consume the content-tail budget and bury a real "resets …" banner below the
+  // detection window (a missed reset → no auto-continue), and their own usage text
+  // ("⚠ Limit", "NN%", "rate limit") can false-match LIMIT_PATTERNS. Each entry is
+  // anchored to a shape the plugin actually renders (model badge, git ahead/behind
+  // pair, timer glyph, todos ratio, tools/agents markers, the CC version segment) so a
+  // real prose line carrying one fragment is NOT stripped — same miss-cost discipline
+  // as the built-in patterns (a false strip pulls a stale banner back into the window).
+  /^\s*\[?(?:Opus|Sonnet|Haiku|GLM|GPT|Gemini|DeepSeek|Grok)\b.*\|.*\d+\s*%/i, // "[Opus] … | 47%" model badge + context %
+  /CC v\d+\.\d+/i,                                                            // "CC v2.1.214" claude-code version segment
+  /\b[↑↓]\s*\d+\s+[↑↓]\s*\d+/,                                                 // git "↑3 ↓1" ahead/behind pair
+  /^\s*[✓✔]\s+.*\(\d+\/\d+\)\s*$/,                                             // todos "✓ All complete (5/5)" row
+  /^\s*[▸]\s+.*\(\d+\/\d+\)\s*$/,                                              // todos "▸ in-progress (2/5)" row
+  /^\s*⏱[️]?\s/,                                                               // session duration timer "⏱️ 12m"
+  /^\s*[◐]\s+\S.*:\s/,                                                         // tools running "◐ Bash: target"
 ];
 // A live working footer ("✻ Cogitating… (esc to interrupt)") matches the spinner glyph
 // pattern above, so it must be excluded explicitly — it is live content, never furniture.

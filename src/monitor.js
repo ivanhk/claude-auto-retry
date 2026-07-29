@@ -16,6 +16,14 @@ const RATE_LIMIT_TAIL_LINES = 12;
 export function createMonitorState() {
   return {
     status: 'monitoring', waitUntil: 0, attempts: 0, lastRateLimitMessage: null,
+    // Cache of the most recent SUCCESSFULLY parsed reset wait (ms + when it was seen).
+    // The interactive /rate-limit-options menu replaces the statusLine region, so a
+    // banner whose reset time was carried by a statusLine plugin (claude-hud's
+    // "Usage ⚠ Limit reached (resets in 2h)") is gone from the capture by the time the
+    // menu is open. When the menu path can't parse a reset time itself, it falls back to
+    // this cache instead of the 5h fallbackWaitHours. Only real parses are cached (a
+    // fallback wait is "unknown", not a known reset). See enterUsageWait / the menu block.
+    lastResetWaitMs: 0, lastResetCachedAt: 0,
     // Overload-retry sub-state, kept distinct from the usage-reset fields above.
     overloadAttempts: 0, overloadTotalWaitMs: 0, overloadWaitUntil: 0,
     // viaEvent marks the current backoff window as event-triggered (edge: one send per
@@ -77,10 +85,37 @@ function enterUsageWait(state, stripped, config) {
   const message = findRateLimitMessage(stripped, config.customPatterns);
   state.lastRateLimitMessage = message;
   const parsed = message ? parseResetTime(message) : null;
-  state.waitUntil = Date.now() + calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours);
+  const waitMs = calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours);
+  state.waitUntil = Date.now() + waitMs;
+  // Only a real parse is a "known" reset worth caching for the menu path to reuse; the
+  // fallbackHours branch means "unknown", so it must NOT overwrite a prior good cache.
+  if (parsed) {
+    state.lastResetWaitMs = waitMs;
+    state.lastResetCachedAt = Date.now();
+  }
   state.status = 'waiting';
   state._gaveUp = false;
   return 'waiting';
+}
+
+// Reuse a reset wait a prior tick cached, decayed by elapsed time. Returns the fallback
+// when there is no usable cache (never parsed, or the cached reset already expired). Used
+// by the menu path when the menu capture itself has no parseable reset time.
+export function resetWaitFromCache(state, config, now = Date.now()) {
+  const { lastResetWaitMs, lastResetCachedAt } = state;
+  if (!lastResetWaitMs || !lastResetCachedAt) {
+    return (config.fallbackWaitHours * 3600 + config.marginSeconds) * 1000;
+  }
+  const elapsed = now - lastResetCachedAt;
+  const remaining = lastResetWaitMs - elapsed;          // the cached wait already ran this long
+  if (remaining <= 0) {
+    // The cached reset has passed — the limit has likely already cleared. Don't park the
+    // session for another 5h; wait just the margin so the post-wait re-check happens soon.
+    return config.marginSeconds * 1000;
+  }
+  // Keep the margin the live parse would have added (the cache stored wait+margin already,
+  // so remaining already includes whatever margin applied at cache time; add none extra).
+  return Math.max(remaining, config.marginSeconds * 1000);
 }
 
 function enterOverload(state, overload, rand) {
@@ -147,7 +182,22 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     const message = findRateLimitMessage(stripped, config.customPatterns);
     state.lastRateLimitMessage = message;
     const parsed = message ? parseResetTime(message) : null;
-    state.waitUntil = Date.now() + calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours);
+    let waitMs;
+    if (parsed) {
+      waitMs = calculateWaitMs(parsed, config.marginSeconds, config.fallbackWaitHours);
+      state.lastResetWaitMs = waitMs;
+      state.lastResetCachedAt = Date.now();
+    } else {
+      // The /rate-limit-options menu replaces the statusLine region, so a banner whose
+      // reset time was carried by a statusLine plugin (claude-hud's "Usage ⚠ Limit
+      // reached (resets in 2h)") — and sometimes Claude Code's own banner — is gone from
+      // the capture by the time the menu is open. Rather than fall straight to the 5h
+      // fallback, reuse a reset time a PRIOR monitoring tick successfully parsed (and
+      // cached in enterUsageWait), decaying it by the time already elapsed since. Without
+      // this a 2h limit was mis-waited as 5h (logs: "Waiting 18060s").
+      waitMs = resetWaitFromCache(state, config);
+    }
+    state.waitUntil = Date.now() + waitMs;
     state.status = 'waiting';
     state._menuCooldownUntil = Date.now() + cooldown;
     return 'menu-confirmed';
