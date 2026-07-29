@@ -121,10 +121,14 @@ const isChromeLine = (l) => !isWorkingLine(l) && CHROME_LINE.some((r) => r.test(
 // chrome-stripping would otherwise expose it — bounding content-distance for the overload
 // path (Finding 6), where a terminal error sits just above the input box and anything
 // reachable only past a tall widget is stale scrollback, not a live error.
-function contentTail(lines, n, maxRaw = Infinity) {
+function contentTailRange(lines, n, maxRaw = Infinity) {
   let end = lines.length;
   while (end > 0 && isChromeLine(lines[end - 1])) end--;
   const start = Math.max(0, end - n, lines.length - maxRaw);
+  return { start, end };
+}
+function contentTail(lines, n, maxRaw = Infinity) {
+  const { start, end } = contentTailRange(lines, n, maxRaw);
   return lines.slice(start, end);
 }
 
@@ -169,9 +173,13 @@ function hasNearbyMatch(lines, idx, patterns, mask = null) {
 // never as `Name(…)`) and the `⎿`/`└`/indented children UNDER such a header. Result
 // markers must NOT mask on their own: a live banner interrupting a tool/agent call
 // renders as a `└` child of a NON-`Name(` notice (`● Agent "…" finished` → `└ You've hit
-// your session limit …` — an observed live incident this suite pins). Known limits: a
-// header wrapped (not truncated) across rows leaves its continuation unmasked, and a
-// window starting mid-block leaves leading children unmasked.
+// your session limit …` — an observed live incident this suite pins). The mask is always
+// computed over the FULL pane and sliced to the detection window afterwards: a window that
+// starts mid-block (tool result taller than the tail) must still know its leading lines
+// are children of a header above the window. Known limits: a header wrapped (not
+// truncated) across rows leaves its continuation unmasked, and "full pane" means the
+// captured pane — a result block taller than the monitor's ~120-line capture leaves its
+// header outside the capture entirely, and the leading children are unmasked again.
 const TOOL_ECHO_HEADER = /^\s*[●⏺∙]\s*\S+\(/;   // "● Bash(grep …", "⏺ Read(file …"
 const TOOL_ECHO_RESULT = /^\s*[⎿└]/;             // "  ⎿  3"
 export function toolEchoMask(lines) {
@@ -196,11 +204,18 @@ export function toolEchoMask(lines) {
 export function isRateLimited(text, customPatterns = [], tailLines = 0) {
   const all = stripAnsi(text).split('\n');
   // Chrome-aware window: trailing UI furniture doesn't consume the tail budget.
-  const lines = tailLines > 0 ? contentTail(all, tailLines) : all;
   // Tool-echo mask (#63), TUI only: print mode scans process output where quoted error
-  // shapes ARE the real signal. Masked AFTER windowing — echo lines still consume tail
-  // budget, so the window can't reach past a tall tool render into stale scrollback.
-  const mask = tailLines > 0 ? toolEchoMask(lines) : null;
+  // shapes ARE the real signal. The window is applied first (echo lines still consume
+  // tail budget, so the window can't reach past a tall tool render into stale
+  // scrollback), but the mask itself is computed over the FULL pane and sliced — a
+  // result block taller than the window would otherwise hide its own `● Name(` header
+  // above the window and leave the quoted children unmasked.
+  let lines = all, mask = null;
+  if (tailLines > 0) {
+    const { start, end } = contentTailRange(all, tailLines);
+    lines = all.slice(start, end);
+    mask = toolEchoMask(all).slice(start, end);
+  }
 
   // Custom patterns test the RAW tail, not the chrome-stripped window (Finding 4). The
   // user owns their own false-positive tradeoff, so a pattern keyed on footer text (a
@@ -248,6 +263,29 @@ export function isRateLimited(text, customPatterns = [], tailLines = 0) {
   }
 
   return false;
+}
+
+// Has the session RESUMED past its limit banner? Used by the monitor's waiting branch,
+// where plain isWorking() was too loose: `Retrying in …`/`attempt N/M` match transcript
+// text, so a flaky-deploy log line lingering ABOVE a live banner made every expiry tick
+// look like "user continued" — the monitor churned waiting↔user-continued forever and
+// never sent the retry. Ordering is the discriminator: a session that actually resumed
+// renders its new work BELOW the banner; working lines above it are history. When no
+// banner is in the window (scrolled away after a real resume, or entered via custom
+// patterns), fall back to plain isWorking — same behavior as before.
+export function resumedAfterLimit(text, tailLines = 0) {
+  const all = stripAnsi(text).split('\n');
+  const { start, end } = tailLines > 0 ? contentTailRange(all, tailLines)
+    : { start: 0, end: all.length };
+  const lines = all.slice(start, end);
+  const mask = toolEchoMask(all).slice(start, end);
+  let lastLimit = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (mask[i]) continue;
+    if (LIMIT_PATTERNS.some(p => p.test(lines[i]))) lastLimit = i;
+  }
+  if (lastLimit === -1) return isWorking(text);
+  return lines.slice(lastLimit + 1).some(isWorkingLine);
 }
 
 // --- Interactive /rate-limit-options menu ---
@@ -328,8 +366,13 @@ const OVERLOAD_MAX_RAW_LINES = 20;
 // Chrome-aware tail for the overload detectors: a terminal error can be pushed up by the
 // same widgets that pushed the limit banner, so strip trailing chrome first — but bound
 // the reach so a widget-buried stale error stays out.
+// Windowed lines PLUS their tool-echo mask (#63). The mask is computed on the full pane
+// and sliced to the window, so a result block taller than the window keeps its children
+// masked even when the `● Name(` header sits above the window.
 function tail(text) {
-  return contentTail(stripAnsi(text).split('\n'), OVERLOAD_TAIL_LINES, OVERLOAD_MAX_RAW_LINES);
+  const all = stripAnsi(text).split('\n');
+  const { start, end } = contentTailRange(all, OVERLOAD_TAIL_LINES, OVERLOAD_MAX_RAW_LINES);
+  return { lines: all.slice(start, end), mask: toolEchoMask(all).slice(start, end) };
 }
 
 // Compile a config pattern (string → case-insensitive RegExp) once per call. Invalid
@@ -358,11 +401,10 @@ const OVERLOAD_ANCHOR = [/\bAPI Error\b/i];
 // logged no reason at all).
 export function overloadMatch(text, patterns = []) {
   if (!patterns || patterns.length === 0) return null;
-  const lines = tail(text);
-  if (!lines.join('').trim()) return null;
   // Tool-echo mask (#63): a quoted "API Error: 529 overloaded" in a Bash() render carries
   // its own anchor on the same line, so the anchor discipline alone can't reject it.
-  const mask = toolEchoMask(lines);
+  const { lines, mask } = tail(text);
+  if (!lines.join('').trim()) return null;
   const regexes = toRegexes(patterns);
   for (let i = 0; i < lines.length; i++) {
     if (mask[i]) continue;
@@ -397,11 +439,10 @@ const SAFEGUARD_ANCHOR = [/\bAPI Error\b/i];
 
 export function safeguardMatch(text, patterns = []) {
   if (!patterns || patterns.length === 0) return null;
-  const lines = tail(text);
-  if (!lines.join('').trim()) return null;
   // Same tool-echo discipline as overloadMatch (#63): a quoted safeguard line in a tool
   // render can sit next to a quoted API Error anchor.
-  const mask = toolEchoMask(lines);
+  const { lines, mask } = tail(text);
+  if (!lines.join('').trim()) return null;
   const regexes = toRegexes(patterns);
   for (let i = 0; i < lines.length; i++) {
     if (mask[i]) continue;
@@ -425,6 +466,18 @@ export function detectSafeguard(text, patterns = []) {
 // (Finding 3). isChromeLine excludes working lines, so contentTail never strips the footer.
 export function isWorking(text) {
   return contentTail(stripAnsi(text).split('\n'), OVERLOAD_TAIL_LINES).some(isWorkingLine);
+}
+
+// Claude Code's OWN internal-retry render ("… · Retrying in 5s · attempt 3/10"). It
+// satisfies isWorking (the turn is open and must not be interrupted), but it is the
+// opposite of RECOVERY — the turn is still failing. Consumers inferring "the incident
+// ended well" from a working pane (the event-path overload budget reset) must exclude it,
+// or a sustained outage's in-flight retries zero the backoff budget every cycle and the
+// give-up cap never trips.
+const INTERNAL_RETRY_PATTERNS = [/Retrying in\b/i, /\battempt\s+\d+\/\d+/i];
+export function isInternalRetry(text) {
+  return contentTail(stripAnsi(text).split('\n'), OVERLOAD_TAIL_LINES)
+    .some((l) => INTERNAL_RETRY_PATTERNS.some((p) => p.test(l)));
 }
 
 export function findRateLimitMessage(text, customPatterns = []) {

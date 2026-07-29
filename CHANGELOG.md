@@ -28,6 +28,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by the elapsed time), only falling back to `fallbackWaitHours` when no cached reset
   exists.
 
+## [0.6.2] - 2026-07-29
+
+### Fixed
+- **Adversarial review of this release's own fixes caught and closed seven follow-ups:**
+  the stdin buffer now mirrors claude's 3-second no-data grace instead of hanging on a
+  held-open pipe (`ssh` without `-n`, CI harnesses); DST-transition wall times that
+  don't exist (spring-forward) or repeat (fall-back) resolve deterministically to the
+  late side on every host; the overload recovery reset no longer counts Claude's own
+  in-flight `Retrying in …` render as recovery (escalation and the give-up cap survive
+  sustained outages) and no longer drops the same-banner memo (no scraper re-fire into
+  a recovered session); exported bash functions (`BASH_FUNC_name%%`) are forwarded
+  again, with a strict-POSIX retry if a tmux build rejects them; the tmux < 3.2 inline
+  branch no longer clobbers the pane's TERM; socket paths with consecutive spaces
+  survive `parsePanes` verbatim.
+- **StopFailure markers are socket-keyed** (like status files): with two tmux servers,
+  a marker for one server's `%2` could be consumed by the monitor watching the other
+  server's `%2`. Readers fall back to the legacy filename so an older installed hook's
+  markers aren't dropped mid-upgrade.
+- **`claude` now launches on tmux 3.0–3.1c (Ubuntu 20.04, Debian 11).** `new-session -e`
+  only exists from tmux 3.2; gating it at 3.0 made session creation fail outright with
+  `unknown option -- e` on those distros. Below 3.2 the critical env vars are exported
+  inline in the command instead.
+- **A tool result taller than the detection window can no longer revive the #63 false
+  positive.** The tool-echo mask is now computed over the full pane and sliced to the
+  window, so quoted banner/error lines stay masked even when their `● Name(` header sits
+  above the window. Applies to the limit, overload, and safeguard matchers.
+- **DST-safe roll-to-tomorrow.** A stale reset time was rolled forward by a flat 24h of
+  milliseconds — one hour short across a fall-back night (the monitor woke early with the
+  banner still live, burned its retries, and gave up before the real reset) and one hour
+  long across spring-forward. Tomorrow's occurrence is now computed on the actual
+  calendar day.
+- **A stale `Retrying in …` / `attempt N/M` transcript line no longer suppresses the
+  retry forever.** The waiting branch treated any working-pattern match as "user
+  continued", churning without ever sending. Resumed now means working signal rendered
+  *below* the last banner line; work above it is history.
+- **Event-path overload incidents close on recovery.** Backoff counters leaked across
+  fully-recovered incidents (escalating 30s → 300s waits for unrelated failures days
+  apart) until the total-wait cap silently disabled the hook path for the session.
+  Counters reset when the pane is seen working again or when a fresh marker arrives well
+  after the last retry.
+- **Print-mode retries keep a piped prompt.** `cat doc.md | claude -p` had its stdin
+  consumed by the first attempt; retries ran with an empty prompt. Piped stdin is now
+  buffered once and re-fed to every attempt.
+- **The shell wrapper no longer wipes user INT/TERM traps in zsh** (macOS default
+  shell). `trap -p` is a bashism; zsh now uses native `localtraps` scoping.
+- **Timer-armed monitors show up in the tmux status bar.** They wrote status files under
+  a `default` socket key the `#{socket_path}`-driven reader never looks up; reconcile now
+  passes the real socket path through.
+- **A monitor on another tmux server's pane no longer masks this server's same-numbered
+  pane in `reconcile`** (pane ids are only unique per server).
+- **tmux session creation no longer fails on Windows (Git Bash / MSYS2) environments.**
+  `tmux new-session -e` rejects non-POSIX variable names that Windows shells always
+  carry (`ProgramFiles(x86)`, `=C:` drive pseudo-vars, `!ExitCode`) with
+  `invalid environment variable name`, which aborted the whole launch. Environment
+  forwarding now filters names to POSIX `[A-Za-z_][A-Za-z0-9_]*`; everything else is
+  passed through unchanged (#58).
+
 ## [0.6.1] - 2026-07-23
 
 ### Fixed

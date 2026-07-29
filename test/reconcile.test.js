@@ -32,6 +32,16 @@ describe('reconcile parsing', () => {
     const p = parsePanes('%1 460807\n%10 1642861\n\n');
     assert.deepEqual(p, [{ pane: '%1', panePid: 460807 }, { pane: '%10', panePid: 1642861 }]);
   });
+  it('parses the socket path third field (spaces preserved) when present', () => {
+    const p = parsePanes('%1 460807 /tmp/tmux-1000/my socket\n');
+    assert.deepEqual(p, [{ pane: '%1', panePid: 460807, socket: '/tmp/tmux-1000/my socket' }]);
+  });
+  it('preserves consecutive spaces in the socket path verbatim', () => {
+    // Collapsing "  " to " " breaks the status key match against #{socket_path} — the
+    // exact blank-segment bug the socket plumbing exists to fix.
+    const p = parsePanes('%0 1103083 /tmp/car bugrev  x/sock\n');
+    assert.deepEqual(p, [{ pane: '%0', panePid: 1103083, socket: '/tmp/car bugrev  x/sock' }]);
+  });
   it('parses ps output with comm and args (args is the trailing field)', () => {
     const p = parseProcesses('1842917 460471 Sl+ claude claude -p "do a thing"\n460471 1 Ss bash -bash\n');
     assert.deepEqual(p[0], { pid: 1842917, ppid: 460471, stat: 'Sl+', comm: 'claude', args: 'claude -p "do a thing"' });
@@ -227,6 +237,27 @@ describe('planReconcile', () => {
   });
 
   it('skips a pane that already has a monitor', () => {
+    const { panes, processes } = fixture();
+    const running = parseRunningMonitors('9 node src/monitor.js %1 200\n');
+    const { arm, skipped } = planReconcile({ panes, processes, running });
+    assert.deepEqual(arm, [{ pane: '%2', pid: 400 }]);
+    assert.equal(skipped.find(s => s.pane === '%1').reason, 'already monitored');
+  });
+
+  // --- Pane ids are only unique per tmux SERVER, but the monitor pgrep is global: a
+  //     monitor watching %1 on `tmux -L work` must not mask the default server's %1
+  //     forever. Coverage only counts when the monitored claude PID actually maps to
+  //     that pane on THIS server's pane tree. ---
+  it('a monitor for the same pane id on ANOTHER tmux server does not mask this one', () => {
+    const { panes, processes } = fixture();
+    // Monitor watching "%1" but for pid 7100 — a claude that lives on a different
+    // server (not in this server's process tree at all).
+    const running = parseRunningMonitors('9 node src/monitor.js %1 7100\n');
+    const { arm } = planReconcile({ panes, processes, running });
+    assert.deepEqual(arm.sort((a, b) => a.pane < b.pane ? -1 : 1),
+      [{ pane: '%1', pid: 200 }, { pane: '%2', pid: 400 }]);
+  });
+  it('a monitor whose claude pid maps to the pane on THIS server still covers it', () => {
     const { panes, processes } = fixture();
     const running = parseRunningMonitors('9 node src/monitor.js %1 200\n');
     const { arm, skipped } = planReconcile({ panes, processes, running });
