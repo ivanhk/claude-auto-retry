@@ -5,7 +5,188 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.3] - 2026-08-16
+
+### Fixed
+- **A live banner is no longer outranked by reset-shaped prose below it (#73).** The
+  reset-message scan returned the lowest reset-shaped line in the pane, and `try again in
+  …` matches ordinary English — so a model sentence ("The API said to try again in 2
+  minutes …") or the user's own question, rendered *below* the banner it discusses, stole
+  the parse and turned a 5-hour wait into ~3 minutes. The monitor then woke into the
+  still-live limit and burned `maxRetries` before the real reset. The discriminator is the
+  shape of the line, not its vocabulary, and it is stated as a *veto*: a reset-shaped line
+  stays eligible unless something marks it as conversation — the user's input row (`❯`/`>`),
+  sentence punctuation, a run-on past the reset clause ("…resets 9am tomorrow according to
+  the header"), or a message bullet introducing something other than a limit or reset
+  clause. The last two are what catch prose whose *wrapped* continuation happens to begin
+  with the clause. Eligibility is decided per line and never by inspecting a neighbour, so
+  the bottom-up scan — and therefore freshness — is unchanged, and anything vetoed falls
+  through to the previous behaviour rather than to no match at all.
+
+  Every signal except the prompt glyph is subordinate to whether the line **names a limit**:
+  a line that does is treated as a render however it is punctuated, glyphed or trailed. That
+  ordering is the correction to this change's own first three revisions, each of which
+  claimed the veto "only demotes what it can positively identify" and then demoted real
+  renders three ways — period-terminated banners ("Rate limit exceeded. Please try again in
+  5 hours."), banners with an inline hint ("· resets 5:20pm · /upgrade to increase your
+  limits"), and the API-error render whose vocabulary is underscored (`rate_limit_error`).
+  The two errors do not cost the same: returning prose parses a *short* wait, which is a
+  fallback and so gets revisited (#70), while returning a stale banner parses a *long* one
+  that latches non-correctable. Doubt therefore resolves toward the fresher line.
+
+  **Known boundary:** prose that names a limit *itself* — "⏺ You've hit your usage limit, so
+  try again in 2 minutes." — is per-line indistinguishable from a render and still outranks
+  the banner. This is unchanged from previous behaviour rather than introduced here, and it
+  is the recoverable direction of the two. Also unchanged: an unglyphed, unpunctuated
+  continuation that begins with the clause and ends within two words (`│  try again in 20
+  minutes  │`), which cannot be separated from a wrapped banner line (`  resets 8:40pm
+  (Europe/London)`) without dropping the only line carrying the time.
+- **The reconcile lock could double-hold under contention (the flaky cross-process suite
+  test was a real race, not a bad test).** After winning the breaker, the stale-lock removal
+  was an *unconditional* `unlink` — even when the re-read under the breaker found the lock
+  already **absent** (its holder released and exited between the staleness verdict and the
+  break). The fast path is deliberately not serialized by the breaker, so an acquirer could
+  create a fresh live lock in that read→unlink gap; the unlink then deleted it and the
+  breaker-holder created a second lock — two reconcile runs proceeding at once, each arming
+  monitors. Reproduced at ~0.2% of contended rounds on a single loaded core (2 overlapping
+  holds in 823, then 1 in 1,072, with the acquisition-path event log pinning the interleave);
+  the stale removal is now identity-checked and skipped entirely when the lock was absent —
+  0 overlaps in 6,205 holds under the same load afterwards. Thanks @nyxaria for flagging the
+  flake.
+
+## [0.7.2] - 2026-08-16
+
+### Fixed
+- **A banner that names `/usage-credits` inline is no longer treated as UI furniture.** The
+  chrome allowlist matched the hint anywhere on a line, but the companion row is not the
+  only place it renders — a session banner can carry it inline ("You've hit your session
+  limit · resets 5:20pm · run /usage-credits to finish"), and the spend-limit banner always
+  does. Those lines were stripped as chrome, so the tail dropped the only line naming the
+  limit: the spend banner needed a special case to be seen at all, and a session banner's
+  reset time was invisible to the parse, sending the monitor to the `fallbackWaitHours`
+  default instead of the real reset. The entry is now anchored to the hint *leading* its
+  row, which covers every banner that mentions it — and removes both the special case and
+  its forward reference to a constant declared 100 lines below.
+- **Spend-limit render shapes that were total misses (#71 follow-up).** The banner pattern
+  admitted only the `⎿`/`└` echo markers, so the `⚠`- and `·`-prefixed renders — markers
+  this file already expects on limit banners — were never matched; the `⚠` in emoji
+  presentation (`⚠️`, U+26A0 + U+FE0F) failed on the variation selector; the **boxed** form
+  (`│ ⚠ You've hit … │`, the render this suite already pins for session banners) was not
+  admitted at all, and unlike a session banner the spend render has no reset line to fall
+  back on; and the pattern required an ASCII apostrophe in "you've" while the qualifier
+  beside it already admitted `’`, so a render in typographic quotes was missed too. All of
+  them compounded with the chrome misclassification above: invisible rather than merely
+  unanchored. The apostrophe is now *required* in the other direction — "youve hit your
+  monthly spend limit" no longer walks the one detection path that needs no reset time.
+- **A wrapped or bulleted quotation of the spend banner no longer false-fires a wait.**
+  `^\s*` is not an anchor when model output wraps with a hanging indent: a continuation line
+  beginning "You've hit your org's monthly spend limit …" entered a 5-hour wait and typed
+  retries into an idle session. A render starts at column 0, behind a box border, behind a
+  flush-left `⚠`/`·` banner marker, or behind a `⎿`/`└` tool-echo marker (the only ones that
+  legitimately render indented, as children of the notice above them). An indented `⚠`/`·`/`•`
+  is a prose bullet — the shape a model quoting the banner actually produces — and no longer
+  counts as a render. (Trailing punctuation deliberately stays out of it — "You've hit your
+  monthly spend limit." is a real render with a full stop.) The column-0 rule is a rendering
+  assumption, so it has one escape hatch: when the **standalone** `/usage-credits` companion
+  row renders below the banner — evidence a quotation essentially never carries, since it
+  reproduces the banner line and not the separate row beneath it — the indented form is
+  accepted, keeping a real render printed one space too far right, or wrapped.
+
+## [0.7.1] - 2026-08-14
+
+### Fixed
+- **The org/monthly spend-limit banner is now detected (#71).** Team/org accounts (and
+  individual accounts whose extra-usage budget is exhausted) get "You've hit your org's
+  monthly spend limit · run /usage-credits …" — undetected for two independent reasons:
+  the render carries no reset time (and detection deliberately anchors on one), and the
+  `org's` possessive defeated the limit-pattern shape. Both reporters confirmed the
+  underlying 5-hour block resets and waiting works, so the banner now routes into the
+  usage wait as a limit with unknown reset: the bounded `fallbackWaitHours` default,
+  latched correctable — if a real "resets <time>" banner appears mid-wait, the wake-up
+  shortens to the true instant, and genuine budget exhaustion ends in the normal
+  max-retries give-up. With no reset line to anchor on, the false-positive defense moves
+  into the shape: only the banner phrasing (line starts "You've hit …"), only next to its
+  `/usage-credits` companion, and only in the live region — prose *explaining* spend
+  limits, and stale banners with real work below, stay inert. The banner also had to be
+  exempted from chrome classification: it carries "/usage-credits" inline, so the
+  companion furniture rule would otherwise classify the banner itself as chrome and hide
+  it from the reset-message scan.
+- **A fallback wait is now corrected once the real reset time appears on screen.** The
+  `/rate-limit-options` menu does not always render a reset line, so confirming "Stop and
+  wait" could commit the `fallbackWaitHours` default (5h) — and the waiting branch returned
+  early on every tick and never looked at the pane again, so the banner Claude Code prints
+  immediately after confirming, which *does* carry the time, was ignored for the whole
+  fallback. Observed live: a session whose limit reset at 18:20 sat parked until 22:27 with
+  `attempts: 0`, ~4 idle hours, while the banner naming 18:20 was on screen the entire time.
+  A wait derived from an unreadable screen is now latched as a fallback and re-derived from
+  the live banner each tick until a real reset time is found; waits that already came from a
+  real reset time are never re-parsed. Confirming the menu starts a fresh retry episode, so
+  the correction still applies when the menu re-renders after a retry has been sent.
+
+## [0.7.0] - 2026-08-13
+
+### Security
+- **Secrets no longer ride any tmux argv (#68).** The environment used to cross into the
+  auto-created session as `new-session -e KEY=VALUE` pairs (and, below tmux 3.2, as
+  inline `export`s in the pane command) — and when that invocation is the one that
+  starts the tmux server, the server keeps the whole argv in `/proc/<pid>/cmdline`,
+  world-readable, for its entire multi-day lifetime. API keys, tokens and connection
+  strings were retrievable with a plain `ps`. The environment now crosses via a `0600`
+  JSON snapshot in a `0700` dir (`~/.claude-auto-retry/tmp/`); only the file *path*
+  appears on the command line, and the inner launcher loads it into `process.env` and
+  unlinks it (with a 24h sweep for launches that died before consuming). Loading in
+  Node rather than `source` round-trips names a POSIX shell can't — `BASH_FUNC_name%%`
+  exported functions, Windows `ProgramFiles(x86)` — which also retires the entire
+  "tmux rejects this env name" launch-failure class (#58) and the lenient/strict retry
+  machinery with it. Environment fidelity is *higher* than before: names the argv
+  filter had to drop now cross intact.
+
+### Changed
+- **Clean exits reap their tmux session (#69).** The pane tail was an unconditional
+  `; exec $SHELL`, so no session was ever destroyed — a clean `/exit` left an idle
+  login shell pinning the session and its whole process tree forever (measured by the
+  reporter: 66 sessions holding 16.4 GB after 3 days). The shell fallback is now
+  reserved for **non-zero** launcher exits, where the crash scrollback is genuinely
+  useful; on a clean exit the pane command ends and tmux reaps the session itself.
+  `CLAUDE_AUTO_RETRY_KEEP_SHELL=1` restores the old behavior.
+- **`CLAUDE_AUTO_RETRY_NO_TMUX=1`** skips tmux session creation entirely, for users
+  already inside a non-tmux multiplexer (Zellij, screen) who don't want a nested
+  session per launch (#69). Explicit opt-out — the nested session is what the monitor
+  drives, so this disables auto-retry for the run, and that trade belongs to the user.
+- The pane command now invokes the launching Node binary by absolute path instead of
+  relying on `node` being resolvable through a possibly-stale tmux server `PATH`.
+
+### Fixed
+- **Launch no longer fails with `server exited unexpectedly` when it races a
+  dying tmux server (#69 follow-up).** Session reaping means the tmux server now
+  exits once the last claude session ends (`exit-empty` defaults on) — and a
+  `new-session` landing in the teardown window (socket still on disk, server
+  draining) connects, sees EOF mid-handshake, and aborted the whole launch. This
+  window could not exist before reaping, because the server never exited.
+  Session creation now retries up to twice (250 ms apart) when the failure is
+  `server exited unexpectedly` / `lost server`; the next attempt finds the
+  socket gone or stale and cold-starts a fresh server. Real failures (duplicate
+  session, tmux missing, bad option) still fail immediately. Reproduced and
+  verified against real tmux 3.4: 23 forced race hits, 23 recovered, 0 residual
+  failures across 250 timed attempts.
+- **A usage-meter statusline no longer hijacks the reset-time parse (#61).** ccusage-style
+  statuslines render a permanent countdown row at the very bottom of the pane
+  ("current ●●●●●●●●●● 100%  ⟳ resets in 1 hr 47 min"). That row matches the reset
+  patterns and sits below any live banner, so the bottom-up scan in
+  `findRateLimitMessage` returned it instead of the banner — and its wording isn't
+  parseable, so a banner with a perfectly good "resets 6:20am (Europe/Brussels)" fell
+  back to the 5-hour default wait. Meter rows (countdown glyph variants, dotted gauges
+  with a percentage, the cost row) are now classified as chrome, and
+  `findRateLimitMessage` skips chrome the same way the detectors already do. This also
+  removes a standing false-positive anchor: the meter's "resets" line no longer
+  validates limit-shaped prose near the bottom of the pane.
+- **A failed env-snapshot write now warns instead of degrading silently** (PR #72
+  review follow-up). If `~/.claude-auto-retry/tmp` is unwritable (read-only or
+  over-quota `$HOME` — NFS-mounted HPC homes especially), the launch still proceeds,
+  but the pane runs with the tmux **server's** startup environment: on a pre-existing
+  server that can be days stale, so a rotated `ANTHROPIC_API_KEY` or fresh proxy var
+  quietly never reached `claude` with zero diagnostic. The degrade stays; the silence
+  goes — a stderr warning now names the cause.
 
 ### Fixed
 - **statusLine plugins (e.g. claude-hud) no longer suppress auto-continue.** A plugin
