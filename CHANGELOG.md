@@ -5,6 +5,76 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **claude-hud's block-gauge usage meters no longer hijack the reset-time parse.** Newer
+  claude-hud layouts render the usage state as one bottom row with block gauges —
+  `Context ██░░░░░░░░ 16% │ Usage ██░░░░░░░░ 20% (resets in 4h 49m)`, optionally with a
+  `| Weekly ████████░░ 81% (resets in 23h 19m)` segment. That "(resets …)" countdown is
+  the rolling session/weekly WINDOW, not the limit reset, and the row renders permanently
+  at the very bottom — so once a real limit banner appeared above it, the bottom-up scan
+  returned the meter's countdown instead of the banner's time (a `resets 3pm` banner
+  parsed as "4h 49m"). Meter rows are now chrome (anchored to a Usage/Weekly label
+  followed by a block-gauge run and a percentage, shapes prose never renders), while the
+  `Usage ⚠ Limit reached (resets in 2h)` variant deliberately stays content — it carries
+  no gauge and is the live limit indicator, often the only one left once Claude Code's
+  own banner has scrolled away.
+
+- **The `/rate-limit-options` menu path no longer floods retries when the limit clears.**
+  After sending the resume message once, the menu-source flag was left set, so the
+  Gate A 30-second cooldown was bypassed on every following tick: the monitor re-sent
+  the retry every poll (5 attempts in ~20 seconds, then an endless "Max retries"
+  flood). The flag is now cleared right after the send, restoring monitoring-path
+  cooldown semantics.
+
+- **The `/rate-limit-options` menu path now auto-continues when the limit clears.** The
+  monitor itself picks "Stop and wait" on this path, so nothing is ever injected. When the
+  banner later vanished (limit cleared) the monitor treated it as "the user resumed" — as it
+  does for the monitoring-detected path — and silently returned to monitoring WITHOUT sending
+  the retry, leaving the session idle. Worse, since the menu-set wait was often a 5h fallback
+  or an over-estimate, the session could sit idle for hours past the real reset. The menu path
+  is now tracked separately (`_waitingViaMenu`): a vanished banner there means "the limit
+  cleared, send the retry" (it also stops parking once the banner is gone, even before the
+  timer expires), while the monitoring path keeps its "user resumed, don't inject" semantics.
+  `resumedAfterLimit` still wins on both paths (a user who took over is never injected into).
+- **The menu path re-captures the pane after confirming to read the reset time.** The menu
+  replaces the statusLine region, so a reset time carried by a statusLine plugin (claude-hud's
+  `Usage ⚠ Limit reached (resets in 2h)`) — and sometimes Claude Code's own banner — is absent
+  from the menu capture. After pressing Enter the menu closes and the banner/statusLine
+  re-renders; the monitor now waits briefly and re-captures to parse the reset, instead of
+  falling straight to the 5h `fallbackWaitHours` (observed live as "Waiting 18060s" for a 2h
+  limit). The cached-reset and fallback remain as last resorts.
+- **The tmux status-bar segment now shows the next auto-continue clock time.** The `waiting`
+  state previously rendered a remaining-time countdown (`⏳AR 3h32m`); it now shows the local
+  time the monitor will next act (`⏳AR 05:21`), which is easier to act on at a glance. Falls
+  back to the countdown if the time conversion fails.
+- **statusLine plugins (e.g. claude-hud) no longer suppress auto-continue.** A plugin
+  that renders its own rows under the input box (model badge, context percentage, git
+  ahead/behind, session timer, todos ratio, divider) put non-built-in furniture in the
+  same live region as Claude Code's rate-limit banner. Those rows weren't in the chrome
+  allowlist, so they consumed the content-tail budget and buried a real `resets …` banner
+  below the detection window — the reset time was never read and no retry was scheduled.
+  They could also false-match the limit patterns (`⚠ Limit`, a usage percentage). The
+  chrome allowlist now recognizes these statusLine rows, so detection works the same with
+  or without a statusLine plugin installed.
+- **Interactive `/rate-limit-options` menu no longer waits the wrong (5h fallback) time
+  when a statusLine plugin carried the reset time.** The menu replaces the statusLine
+  region, so once it opens a banner whose reset time was shown by claude-hud (`Usage ⚠
+  Limit reached (resets in 2h)`) — and sometimes Claude Code's own banner — is gone from
+  the capture, and the menu text carries no parseable reset time. The menu path then fell
+  back to `fallbackWaitHours` (5h), so a 2h limit was mis-waited as ~5h and the
+  auto-continue fired hours late (observed in the logs as "Waiting 18060s"). The menu path
+  now reuses a reset time a prior monitoring tick successfully parsed and cached (decayed
+  by the elapsed time), only falling back to `fallbackWaitHours` when no cached reset
+  exists.
+- **Compound relative reset times (e.g. `1h 59m`) are no longer truncated.** A statusLine
+  plugin (claude-hud) formats the reset as `resets in 1h 59m` / `1 hour 30 minutes`, but the
+  relative-time regex only captured the first `<number><unit>` segment, so `1h 59m` was
+  parsed as `1h` — under-waiting by the trailing minutes and firing `maxRetries` before the
+  real reset (observed live: `1h 59m` → `Waiting 3660s`, then 5 premature retries an hour
+  early). The regex now captures an optional trailing minutes segment and the two are summed.
+
 ## [0.7.3] - 2026-08-16
 
 ### Fixed
@@ -187,27 +257,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   server that can be days stale, so a rotated `ANTHROPIC_API_KEY` or fresh proxy var
   quietly never reached `claude` with zero diagnostic. The degrade stays; the silence
   goes — a stderr warning now names the cause.
-
-### Fixed
-- **statusLine plugins (e.g. claude-hud) no longer suppress auto-continue.** A plugin
-  that renders its own rows under the input box (model badge, context percentage, git
-  ahead/behind, session timer, todos ratio, divider) put non-built-in furniture in the
-  same live region as Claude Code's rate-limit banner. Those rows weren't in the chrome
-  allowlist, so they consumed the content-tail budget and buried a real `resets …` banner
-  below the detection window — the reset time was never read and no retry was scheduled.
-  They could also false-match the limit patterns (`⚠ Limit`, a usage percentage). The
-  chrome allowlist now recognizes these statusLine rows, so detection works the same with
-  or without a statusLine plugin installed.
-- **Interactive `/rate-limit-options` menu no longer waits the wrong (5h fallback) time
-  when a statusLine plugin carried the reset time.** The menu replaces the statusLine
-  region, so once it opens a banner whose reset time was shown by claude-hud (`Usage ⚠
-  Limit reached (resets in 2h)`) — and sometimes Claude Code's own banner — is gone from
-  the capture, and the menu text carries no parseable reset time. The menu path then fell
-  back to `fallbackWaitHours` (5h), so a 2h limit was mis-waited as ~5h and the
-  auto-continue fired hours late (observed in the logs as "Waiting 18060s"). The menu path
-  now reuses a reset time a prior monitoring tick successfully parsed and cached (decayed
-  by the elapsed time), only falling back to `fallbackWaitHours` when no cached reset
-  exists.
 
 ## [0.6.2] - 2026-07-29
 
