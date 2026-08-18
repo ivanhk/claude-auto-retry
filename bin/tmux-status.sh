@@ -59,13 +59,21 @@ fi
 
 case "$status" in
   waiting)
+    # Next auto-continue time (local HH:MM) — easier to act on than a raw countdown.
+    # waitUntil is epoch seconds; date -r is BSD/macOS, date -d @ is GNU/Linux.
     waitUntil=$(printf '%s' "$json" | grep -o '"waitUntil":[0-9]*' | head -1 | grep -o '[0-9]*')
-    remain=$(( waitUntil - now ))
-    [ "$remain" -lt 0 ] && remain=0
-    if [ "$remain" -ge 3600 ]; then
-      printf '⏳AR %dh%02dm' $(( remain / 3600 )) $(( (remain % 3600) / 60 ))
+    clock=$(date -r "$waitUntil" +%H:%M 2>/dev/null || date -d @"$waitUntil" +%H:%M 2>/dev/null)
+    if [ -n "$clock" ]; then
+      printf '⏳AR %s' "$clock"
     else
-      printf '⏳AR %dm' $(( remain / 60 ))
+      # date conversion failed — fall back to the remaining-time countdown.
+      remain=$(( waitUntil - now ))
+      [ "$remain" -lt 0 ] && remain=0
+      if [ "$remain" -ge 3600 ]; then
+        printf '⏳AR %dh%02dm' $(( remain / 3600 )) $(( (remain % 3600) / 60 ))
+      else
+        printf '⏳AR %dm' $(( remain / 60 ))
+      fi
     fi
     ;;
   overload)
