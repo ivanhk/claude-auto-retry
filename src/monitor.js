@@ -33,6 +33,12 @@ export function createMonitorState() {
     // fallbackWaitHours default) and is therefore still open to correction. See
     // correctUsageWait.
     _waitIsFallback: false,
+    // True when the current 'waiting' state was entered via the interactive
+    // /rate-limit-options menu (the monitor itself picked "Stop and wait"), vs the
+    // monitoring-detected enterUsageWait path. The waiting branch uses this to decide
+    // whether a vanished banner means "the user resumed, don't inject" (monitoring path)
+    // or "the limit cleared but nothing was ever sent, so DO send the retry" (menu path).
+    _waitingViaMenu: false,
     // Overload-retry sub-state, kept distinct from the usage-reset fields above.
     overloadAttempts: 0, overloadTotalWaitMs: 0, overloadWaitUntil: 0,
     // viaEvent marks the current backoff window as event-triggered (edge: one send per
@@ -125,6 +131,9 @@ function enterUsageWait(state, stripped, config, { fresh = false } = {}) {
     state.lastResetWaitMs = until - Date.now();
     state.lastResetCachedAt = Date.now();
   }
+  // Every enterUsageWait caller is the monitoring-detected path — the menu path sets the
+  // flag AFTER its own call, so clearing it here is what keeps the two paths distinct.
+  state._waitingViaMenu = false;
   return 'waiting';
 }
 
@@ -241,23 +250,40 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
       await new Promise(r => setTimeout(r, 80));
     }
     await tmuxAdapter.sendKey(pane, 'Enter');
-    // Parse the reset time straight from the menu text, so the wait does not depend on the
-    // limit banner still being visible afterward. The menu does not always RENDER a reset
-    // line, though — and it replaces the statusLine region, so a reset time carried by a
-    // statusLine plugin (claude-hud's "Usage ⚠ Limit reached (resets in 2h)") — sometimes
-    // Claude Code's own banner — is gone from the capture while the menu is open. When the
-    // menu capture is unreadable, reuse a reset a PRIOR monitoring tick successfully parsed
-    // (cached in enterUsageWait), decayed by the time already elapsed since, instead of
-    // falling straight to the fallbackWaitHours default — without this a 2h limit was
-    // mis-waited as 5h ("Waiting 18060s" in the logs). Only when no cache exists does the
-    // fallback land, which correctUsageWait can then shorten once Claude Code re-renders a
-    // banner post-confirm.
+    // Parse the reset time, so the wait does not depend on the limit banner still being
+    // visible afterward. The menu does not always RENDER a reset line, though — and it
+    // replaces the statusLine region, so a reset time carried by a statusLine plugin
+    // (claude-hud's "Usage ⚠ Limit reached (resets in 2h)") — sometimes Claude Code's own
+    // banner — is gone from the capture while the menu is open. Sources, in order: the
+    // menu capture, re-captures after Enter closes the menu (the banner/statusLine
+    // re-renders), a reset a PRIOR monitoring tick successfully parsed (cached in
+    // enterUsageWait, decayed by elapsed time — without this a 2h limit was mis-waited as
+    // 5h, "Waiting 18060s" in the logs), and only then the fallbackWaitHours default —
+    // which correctUsageWait can still shorten once Claude Code re-renders a banner.
     //
     // fresh: a menu we just confirmed means the session hit the limit again, so this is a
     // new retry episode — carrying the old attempt count over left the correction blocked
     // and, once maxRetries had been reached, published a healthy-looking countdown that
     // gave up again on expiry without ever sending.
     enterUsageWait(state, stripped, config, { fresh: true });
+    if (state._waitIsFallback) {
+      // Menu closes on Enter; the banner/statusLine re-renders. Wait briefly and re-capture.
+      for (const delay of [250, 500, 1000]) {
+        await new Promise(r => setTimeout(r, delay));
+        const reRaw = await tmuxAdapter.capturePane(pane, 120);
+        const { message, parsed, until } = usageWaitUntil(stripAnsi(reRaw), config);
+        if (parsed) {
+          // A live parse post-confirm — real reset, so latch and cache it exactly like
+          // enterUsageWait would have.
+          state.lastRateLimitMessage = message;
+          state.waitUntil = until;
+          state._waitIsFallback = false;
+          state.lastResetWaitMs = until - Date.now();
+          state.lastResetCachedAt = Date.now();
+          break;
+        }
+      }
+    }
     if (state._waitIsFallback && state.lastResetWaitMs && state.lastResetCachedAt) {
       // The cached reset is a REAL parse re-anchored in time, not the fallback default —
       // clear the latch so correctUsageWait leaves it alone. (resetWaitFromCache already
@@ -265,6 +291,10 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
       state.waitUntil = Date.now() + resetWaitFromCache(state, config);
       state._waitIsFallback = false;
     }
+    // The monitor itself dismissed Claude's options here, so a later vanished banner means
+    // "the limit cleared" (not "the user resumed") — the waiting branch must then SEND the
+    // retry rather than silently returning to monitoring.
+    state._waitingViaMenu = true;
     state._menuCooldownUntil = Date.now() + cooldown;
     return 'menu-confirmed';
   }
@@ -283,8 +313,15 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     // lastRateLimitMessage is set ONLY on the branch that logs it — a correction that falls
     // through to 'retried'/'user-continued' would otherwise leave the message set for the
     // next plain 'waiting' tick to log as a spurious fresh detection.
+    //
+    // MENU PATH EXCEPTION: the monitor itself picked "Stop and wait", so nothing was ever
+    // injected. If the banner is already gone (limit cleared before waitUntil — common,
+    // since the menu-set wait is often a fallback or an over-estimate), do NOT keep parking
+    // the idle session; fall through so the retry send below fires.
     const correctedMessage = correctUsageWait(state, stripped, config);
-    if (Date.now() < state.waitUntil && !resumedAfterLimit(stripped, RATE_LIMIT_TAIL_LINES)) {
+    const limitGone = !isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES);
+    const resumed = resumedAfterLimit(stripped, RATE_LIMIT_TAIL_LINES);
+    if (Date.now() < state.waitUntil && !resumed && !(state._waitingViaMenu && limitGone)) {
       if (!correctedMessage) return 'waiting';
       state.lastRateLimitMessage = correctedMessage;
       return 'wait-corrected';
@@ -297,9 +334,19 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     // captured scrollback after a successful resume — spamming an actively-working
     // session (and a banner re-printed by another process keeps it "rate-limited" the
     // whole time). Resumed ⇒ the session continued; never inject into it.
-    if (!isRateLimited(stripped, config.customPatterns, RATE_LIMIT_TAIL_LINES) || resumedAfterLimit(stripped, RATE_LIMIT_TAIL_LINES)) {
+    //
+    // But for the MENU path a vanished banner is NOT a human resume — the monitor parked
+    // the session itself, so it must send the retry to resume the turn. Fall through to
+    // the retry send below instead of returning 'user-continued'.
+    if ((limitGone || resumed) && !state._waitingViaMenu) {
       state.status = 'monitoring'; state.attempts = 0; state._gaveUp = false;
-      state._waitIsFallback = false;
+      state._waitIsFallback = false; state._waitingViaMenu = false;
+      return 'user-continued';
+    }
+    // Menu path: a resumed session still means don't inject (the user took over).
+    if (state._waitingViaMenu && resumed) {
+      state.status = 'monitoring'; state.attempts = 0; state._gaveUp = false;
+      state._waitIsFallback = false; state._waitingViaMenu = false;
       return 'user-continued';
     }
 
@@ -337,6 +384,14 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     state.waitUntil = Date.now() + 30_000;
     state._waitIsFallback = false;   // send cooldown, deliberately unrelated to the reset time
     await tmuxAdapter.sendKeys(pane, config.retryMessage);
+    // Clear the menu-source flag once we've injected: the Gate A bypass
+    // (_waitingViaMenu && limitGone) is only meant to skip idle parking up to the
+    // FIRST send. Leaving it set afterwards re-bypassed the 30s cooldown on every
+    // following tick (limit cleared → limitGone stays true), so the monitor re-sent
+    // the retry every poll (5 attempts in ~20s, then an endless "Max retries"
+    // flood). Clearing it restores monitoring-path semantics: 30s cooldown holds,
+    // and a later banner-gone/resumed returns 'user-continued' instead of firing.
+    state._waitingViaMenu = false;
     return 'retried';
   }
 

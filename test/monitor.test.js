@@ -184,6 +184,139 @@ describe('processOneTick', () => {
       assert.equal(resetWaitFromCache(s, cfg, 1000 + 7200_000), cfg.marginSeconds * 1000);
     });
   });
+
+  // --- Menu path must auto-continue when the limit clears ---
+  //   The monitor itself picked "Stop and wait", so nothing was injected. When the banner
+  //   vanishes (limit cleared) the monitoring-path assumption "user resumed, don't inject"
+  //   is WRONG for the menu path: the session is idle and needs the retry sent. Observed
+  //   live: menu set a 5h wait, reset cleared hours early, the session sat idle until the
+  //   timer expired and then returned 'user-continued' without ever sending the retry.
+  describe('menu path auto-continues when the limit clears', () => {
+    it('sends the retry (not user-continued) when the banner is gone after wait expiry', async () => {
+      // Wait expired; pane now shows ordinary idle content (no limit banner).
+      const t = mockTmux('some ordinary output after the reset');
+      const s = createMonitorState();
+      s.status = 'waiting'; s.waitUntil = Date.now() - 1000; s._waitingViaMenu = true;
+      assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'retried');
+      assert.equal(t._sent.length, 1);            // the retry IS sent
+      assert.equal(s.attempts, 1);
+    });
+
+    it('sends the retry immediately if the banner clears BEFORE waitUntil (no idle parking)', async () => {
+      const t = mockTmux('ordinary output, limit already gone');
+      const s = createMonitorState();
+      s.status = 'waiting';
+      s.waitUntil = Date.now() + 2 * 3600_000;    // timer still has 2h to run
+      s._waitingViaMenu = true;
+      assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'retried');
+      assert.equal(t._sent.length, 1);
+    });
+
+    it('still respects resumedAfterLimit: does not inject if the user took over', async () => {
+      // The user manually typed, so Claude is working — even on the menu path, don't inject.
+      const t = mockTmux('5-hour limit reached - resets 3pm (UTC)\n· Doing… (esc to interrupt)');
+      const s = createMonitorState();
+      s.status = 'waiting'; s.waitUntil = Date.now() - 1000; s._waitingViaMenu = true;
+      assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'user-continued');
+      assert.equal(t._sent.length, 0);
+      assert.equal(s._waitingViaMenu, false);
+    });
+
+    it('gives up after maxRetries if the banner never clears and Claude never responds', async () => {
+      // Banner still present, Claude idle (not working). Retry fires until maxRetries.
+      const t = mockTmux('5-hour limit reached - resets 3pm (UTC)');
+      const s = createMonitorState();
+      s.status = 'waiting'; s.waitUntil = Date.now() - 1000;
+      s._waitingViaMenu = true; s.attempts = DEFAULT_CONFIG.maxRetries;
+      assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'max-retries');
+      assert.equal(t._sent.length, 0);
+    });
+
+    // Regression for the multi-send flood: after the first send, the menu-source flag
+    // must be cleared so the Gate A 30s cooldown holds on subsequent ticks. Without the
+    // clear, every following tick saw limitGone (banner gone) && _waitingViaMenu still
+    // true → bypassed the cooldown → re-sent the retry every poll (5 attempts in ~20s,
+    // then endless "Max retries"). Each tick here is the post-send steady state: wait
+    // still in the future (30s cooldown set by the send), banner gone, Claude idle.
+    it('does not flood retries on later ticks once the menu path has sent once', async () => {
+      const t = mockTmux('ordinary output after the reset');
+      const s = createMonitorState();
+      s.status = 'waiting'; s.waitUntil = Date.now() - 1000; s._waitingViaMenu = true;
+      assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'retried');
+      assert.equal(t._sent.length, 1);
+      assert.equal(s.attempts, 1);
+      // Subsequent ticks: cooldown (waitUntil now +30s) is in the future, so the
+      // monitor must park — not send again, not bypass the cooldown.
+      for (let i = 0; i < 3; i++) {
+        assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'waiting');
+      }
+      assert.equal(t._sent.length, 1);            // still exactly one send
+      assert.equal(s.attempts, 1);
+      assert.equal(s._waitingViaMenu, false);      // cleared by the send
+    });
+
+    // Regression guard: the monitoring-detected path is unchanged — a vanished banner there
+    // still means "user resumed" and does NOT send the retry.
+    it('monitoring path still returns user-continued (no inject) when the banner is gone', async () => {
+      const t = mockTmux('ordinary output after reset');
+      const s = createMonitorState();
+      s.status = 'waiting'; s.waitUntil = Date.now() - 1000; s._waitingViaMenu = false;
+      assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'user-continued');
+      assert.equal(t._sent.length, 0);
+    });
+  });
+
+  // --- Menu path re-captures after confirming, to parse a reset hidden by the menu ---
+  describe('menu path re-captures to parse the reset time', () => {
+    // mockTmux variant whose capturePane returns a sequence (menu first, then the re-render).
+    function sequencedTmux(captures, paneCommand = 'node', claudeForeground = true) {
+      const t = {
+        _sent: [], _keys: [], _capIdx: 0,
+        capturePane: async () => captures[Math.min(t._capIdx++, captures.length - 1)],
+        getPaneCommand: async () => paneCommand,
+        sendKeys: async (_p, text) => { t._sent.push(text); },
+        sendKey: async (_p, key) => { t._keys.push(key); },
+        isClaudeForeground: async () => claudeForeground,
+      };
+      return t;
+    }
+
+    it('parses the reset from the re-rendered banner after the menu closes', async () => {
+      // First capture: the menu (no reset time). Re-captures: the banner re-rendered.
+      const menuOnly = [
+        'What do you want to do?',
+        '❯ 1. Upgrade your plan',
+        '  2. Stop and wait for limit to reset',
+        'Enter to confirm · Esc to cancel',
+      ].join('\n');
+      const withBanner = "You've hit your session limit · resets 3pm (UTC)";
+      const t = sequencedTmux([menuOnly, withBanner, withBanner, withBanner]);
+      const s = createMonitorState();
+      const before = Date.now();
+      assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'menu-confirmed');
+      // A successful parse caches lastResetWaitMs; the 5h fallback does NOT cache. So a
+      // non-zero cache proves the re-capture's "resets 3pm" was parsed (not the fallback).
+      assert.ok(s.lastResetWaitMs > 0 && s.lastResetCachedAt >= before,
+        `expected the re-captured reset to be parsed & cached, got waitMs=${s.lastResetWaitMs}`);
+      assert.equal(s._waitingViaMenu, true);
+    });
+
+    it('still works when neither the menu nor re-capture yields a reset (cache/fallback)', async () => {
+      const menuOnly = [
+        'What do you want to do?',
+        '❯ 1. Upgrade your plan',
+        '  2. Stop and wait for limit to reset',
+        'Enter to confirm · Esc to cancel',
+      ].join('\n');
+      const idle = 'ordinary idle pane, no banner';
+      const t = sequencedTmux([menuOnly, idle, idle, idle]);
+      const s = createMonitorState();             // no cache either
+      const before = Date.now();
+      assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'menu-confirmed');
+      const waitSec = Math.round((s.waitUntil - before) / 1000);
+      assert.ok(waitSec >= 18000 && waitSec <= 18100, `expected fallback ~18060s, got ${waitSec}s`);
+    });
+  });
   it('exits when PID dead', async () => {
     const t = mockTmux('5-hour limit reached - resets 3pm (UTC)');
     const s = createMonitorState();
