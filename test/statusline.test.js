@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   isRateLimited, findRateLimitMessage, detectOverload, isWorking,
 } from '../src/patterns.js';
+import { parseResetTime } from '../src/time-parser.js';
 import { DEFAULT_OVERLOAD } from '../src/config.js';
 
 const TAIL = 12; // RATE_LIMIT_TAIL_LINES
@@ -149,5 +150,86 @@ describe('statusLine chrome patterns are precise (no false strips)', () => {
       ...CHROME,
     ].join('\n');
     assert.equal(isRateLimited(pane, [], TAIL), false);
+  });
+});
+
+// claude-hud's newer layouts render the usage state as one bottom row with block gauges:
+//   V1: "Context ██░░░░░░░░ 21% │ Usage ⚠ Limit reached (resets in 2h)"        — LIMITED
+//   V2: "Context ██░░░░░░░░ 16% │ Usage ██░░░░░░░░ 20% (resets in 4h 49m)"      — meter
+//   V3: V2 + " | Weekly ████████░░ 81% (resets in 23h 19m)"                    — meter + weekly
+// V1 is the live limit indicator (often the only one once CC's own banner scrolled away)
+// and must stay content; V2/V3 are informational meters whose "(resets …)" is the rolling
+// session/weekly WINDOW, not the limit reset — they must be chrome so they neither
+// false-match a limit nor hijack a real banner's reset via the bottom-up scan.
+describe('claude-hud gauge meter rows (Context │ Usage │ Weekly)', () => {
+  const V1 = 'Context ██░░░░░░░░ 21% │ Usage ⚠ Limit reached (resets in 2h)';
+  const V2 = 'Context ██░░░░░░░░ 16% │ Usage ██░░░░░░░░ 20% (resets in 4h 49m)';
+  const V3 = 'Context ██░░░░░░░░ 16% │ Usage ██░░░░░░░░ 20% (resets in 4h 49m) | Weekly ████████░░ 81% (resets in 23h 19m)';
+  const banner = "You've hit your session limit · resets 3pm (UTC)";
+
+  it('V1 (⚠ Limit reached) IS detected and its reset parses', () => {
+    const pane = ['some ordinary content', V1, ...CHROME].join('\n');
+    assert.equal(isRateLimited(pane, [], TAIL), true);
+    assert.match(findRateLimitMessage(pane, [], TAIL), /Limit reached/);
+    const r = parseResetTime(findRateLimitMessage(pane, [], TAIL));
+    assert.ok(r && r.relative, 'reset must parse as relative');
+    assert.equal(r.waitMs, 2 * 3_600_000);
+  });
+
+  it('V2/V3 meters alone do NOT read as a limit', () => {
+    for (const v of [V2, V3]) {
+      const pane = ['some ordinary content', v, ...CHROME].join('\n');
+      assert.equal(isRateLimited(pane, [], TAIL), false, v);
+      assert.equal(findRateLimitMessage(pane, [], TAIL), null, v);
+    }
+  });
+
+  it('V2/V3 meters below a real banner do NOT hijack its reset', () => {
+    for (const v of [V2, V3]) {
+      const pane = [banner, v, ...CHROME].join('\n');
+      assert.equal(isRateLimited(pane, [], TAIL), true, v);
+      const msg = findRateLimitMessage(pane, [], TAIL);
+      assert.match(msg, /resets 3pm/, `the banner must win over the meter — got: ${msg}`);
+      assert.doesNotMatch(msg, /4h|Weekly|23h/, v);
+    }
+  });
+
+  it('a real banner ABOVE the V1 limit row still detects (both name the limit)', () => {
+    const pane = [banner, V1, ...CHROME].join('\n');
+    assert.equal(isRateLimited(pane, [], TAIL), true);
+  });
+
+  it('a real WEEKLY limit (⚠ variant, no gauge) still detects and parses fully', () => {
+    // The gauge is what marks a row as a meter; "Weekly ⚠ Limit reached (resets in 23h
+    // 19m)" has none, so it is content — the live indicator for a weekly limit, and the
+    // compound-duration parse must keep the trailing 19m (was truncated to 23h).
+    const weekly = 'Weekly ⚠ Limit reached (resets in 23h 19m)';
+    const pane = ['some ordinary content', 'Context ██░░░░░░░░ 16% │ Usage ██░░░░░░░░ 20%', weekly, ...CHROME].join('\n');
+    assert.equal(isRateLimited(pane, [], TAIL), true);
+    assert.match(findRateLimitMessage(pane, [], TAIL), /Weekly ⚠ Limit reached/);
+    const r = parseResetTime(findRateLimitMessage(pane, [], TAIL));
+    assert.ok(r && r.relative, 'reset must parse as relative');
+    assert.equal(r.waitMs, (23 * 60 + 19) * 60_000);
+  });
+
+  it('a weekly GAUGE segment on its own row is chrome too', () => {
+    // Some claude-hud versions render the weekly meter as a separate row; the pattern
+    // anchors on the label+gauge shape, not on line position, so it must still strip.
+    const weekly = 'Weekly ████████░░ 81% (resets in 23h 19m)';
+    const alone = ['ordinary content', 'Context ██░░░░░░░░ 16% │ Usage ██░░░░░░░░ 20%', weekly, ...CHROME].join('\n');
+    assert.equal(isRateLimited(alone, [], TAIL), false);
+    const below = [banner, 'Context ██░░░░░░░░ 16% │ Usage ██░░░░░░░░ 20%', weekly, ...CHROME].join('\n');
+    assert.match(findRateLimitMessage(below, [], TAIL), /resets 3pm/);
+  });
+
+  it('prose about usage/percentages (no gauge run) is NOT stripped', () => {
+    const pane = [
+      'We have used 20% of the weekly budget so far, resets in spirit only',
+      ...CHROME,
+    ].join('\n');
+    assert.equal(isRateLimited(pane, [], TAIL), false);
+    // The sentence stays content: it carries no limit name, so nothing detects — but it
+    // must not be dropped from the window either (it is the last content line).
+    assert.equal(findRateLimitMessage(pane, [], TAIL), null);
   });
 });

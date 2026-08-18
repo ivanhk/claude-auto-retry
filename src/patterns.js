@@ -139,6 +139,18 @@ const CHROME_LINE = [
   /^\s*[▸]\s+.*\(\d+\/\d+\)\s*$/,                                              // todos "▸ in-progress (2/5)" row
   /^\s*⏱[️]?\s/,                                                               // session duration timer "⏱️ 12m"
   /^\s*[◐]\s+\S.*:\s/,                                                         // tools running "◐ Bash: target"
+  // claude-hud's usage-meter rows (same role as the ccusage meters above, block-gauge
+  // render): "Context ██░░░░░░░░ 16% │ Usage ██░░░░░░░░ 20% (resets in 4h 49m)" and the
+  // "| Weekly ████████░░ 81% (resets in 23h 19m)" segment. Their "(resets …)" countdown is
+  // the rolling session/weekly WINDOW, not the limit reset — rendered permanently at the
+  // very bottom, it hijacked findRateLimitMessage's bottom-up scan (a real banner above
+  // lost its reset to the meter's "4h 49m") and handed a free "resets" anchor to
+  // limit-shaped prose. Anchored to a Usage/Weekly label directly followed by a block-gauge
+  // run (U+2588/2591) and a percentage — prose never renders gauges. The ⚠ variant
+  // deliberately does NOT match: "Usage ⚠ Limit reached (resets in 2h)" has no gauge and IS
+  // the live limit indicator, often the only one left once Claude Code's own banner has
+  // scrolled away.
+  /\b(?:Usage|Weekly)\s+[█▓▒░]{2,}\s*\d+%/u,                                    // "Usage ██░░░░░░░░ 20% (resets in …)" meter
 ];
 // A live working footer ("✻ Cogitating… (esc to interrupt)") matches the spinner glyph
 // pattern above, so it must be excluded explicitly — it is live content, never furniture.
