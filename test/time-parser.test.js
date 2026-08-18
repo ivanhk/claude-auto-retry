@@ -65,6 +65,26 @@ describe('parseResetTime', () => {
     assert.ok(r.relative);
     assert.equal(r.waitMs, 2 * 3_600_000);
   });
+
+  // --- Compound relative forms rendered by statusLine plugins (claude-hud) ---
+  //   claude-hud formats the reset as "1h 59m" / "1 hour 30 minutes". The old single-segment
+  //   regex matched only the "1h", under-waiting by the trailing minutes and firing retries
+  //   before the real reset (observed live: "1h 59m" → 3660s, then 5 premature retries).
+  it('parses "resets in 1h 59m" (compound h+m)', () => {
+    const r = parseResetTime('Context ████░░ 43% │ Usage ⚠ Limit reached (resets in 1h 59m)');
+    assert.ok(r.relative);
+    assert.equal(r.waitMs, (1 * 60 + 59) * 60_000);
+  });
+  it('parses "resets in 1h 30m"', () => {
+    const r = parseResetTime('resets in 1h 30m');
+    assert.ok(r.relative);
+    assert.equal(r.waitMs, (1 * 60 + 30) * 60_000);
+  });
+  it('parses "resets in 1 hour 30 minutes" (long-form compound)', () => {
+    const r = parseResetTime('try again in 1 hour 30 minutes');
+    assert.ok(r.relative);
+    assert.equal(r.waitMs, (1 * 60 + 30) * 60_000);
+  });
 });
 
 describe('calculateWaitMs', () => {

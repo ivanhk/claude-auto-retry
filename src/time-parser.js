@@ -1,5 +1,11 @@
 const RESET_TIME_REGEX = /resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(([^)]+)\))?/i;
-const RELATIVE_TIME_REGEX = /(?:try again|wait|resets?\s+in)[:\s]\s*(?:for\s+)?(?:in\s+)?(\d+)\s*(hours?|minutes?|mins?|h|m)\b/i;
+// Relative time, e.g. "try again in 5 minutes" / "wait 2 hours" / "resets in 3h". Captures
+// an optional SECOND amount+unit so compound forms are not truncated: a statusLine plugin
+// (claude-hud) renders "resets in 1h 59m" / "1 hour 30 minutes", and the old single-segment
+// regex parsed only the "1h", under-waiting by the trailing minutes (observed: "1h 59m"
+// → 3660s instead of 7140s, firing maxRetries an hour before the real reset).
+//   group 1+2: first amount/unit; group 3+4: optional second amount/unit (the minutes).
+const RELATIVE_TIME_REGEX = /(?:try again|wait|resets?\s+in)[:\s]\s*(?:for\s+)?(?:in\s+)?(\d+)\s*(hours?|minutes?|mins?|h|m)\b(?:\s*(\d+)\s*(minutes?|mins?|m)\b)?/i;
 
 export function parseResetTime(text) {
   // Try absolute time first: "resets at 3pm (UTC)"
@@ -21,13 +27,14 @@ export function parseResetTime(text) {
     return { hour, minute, timezone, ambiguous };
   }
 
-  // Try relative time: "try again in 5 minutes" / "wait 2 hours"
+  // Try relative time: "try again in 5 minutes" / "wait 2 hours" / "resets in 1h 30m"
   const relMatch = text.match(RELATIVE_TIME_REGEX);
   if (relMatch) {
-    const amount = parseInt(relMatch[1], 10);
-    const unit = relMatch[2].toLowerCase();
-    const isMinutes = unit.startsWith('m');
-    const ms = amount * (isMinutes ? 60_000 : 3_600_000);
+    let ms = 0;
+    // First segment: hours or minutes (a bare "m" is always minutes).
+    ms += parseInt(relMatch[1], 10) * (relMatch[2].toLowerCase().startsWith('m') ? 60_000 : 3_600_000);
+    // Optional second segment: the trailing minutes of a compound "1h 59m".
+    if (relMatch[3]) ms += parseInt(relMatch[3], 10) * 60_000;
     return { relative: true, waitMs: ms };
   }
 
