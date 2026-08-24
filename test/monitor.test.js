@@ -255,14 +255,41 @@ describe('processOneTick', () => {
       assert.equal(s._waitingViaMenu, false);      // cleared by the send
     });
 
-    // Regression guard: the monitoring-detected path is unchanged — a vanished banner there
-    // still means "user resumed" and does NOT send the retry.
-    it('monitoring path still returns user-continued (no inject) when the banner is gone', async () => {
-      const t = mockTmux('ordinary output after reset');
+    // Regression guard: the monitoring-detected path ALSO sends when the banner is gone at
+    // expiry and the pane is idle. A banner that disappears exactly when the wait expires
+    // is the normal end of a correctly-timed wait (the reset passed while the session sat
+    // parked) — the old rule read it as "user resumed" and silently returned to monitoring,
+    // so the auto-continue never fired (four straight days of live logs: "Waiting 9000s…"
+    // → "User already continued", nothing in between).
+    it('monitoring path SENDS the retry when the banner is gone at expiry and the pane is idle', async () => {
+      const t = mockTmux('ordinary output after the reset');
+      const s = createMonitorState();
+      s.status = 'waiting'; s.waitUntil = Date.now() - 1000; s._waitingViaMenu = false;
+      assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'retried');
+      assert.equal(t._sent.length, 1);
+    });
+
+    it('monitoring path still stays silent when Claude is WORKING (resumed) at expiry', async () => {
+      // The user took over during the wait — never inject. `resumed`, not the vanished
+      // banner, is what silences the monitor.
+      const t = mockTmux("You've hit your session limit · resets 3pm (UTC)\n· Doing… (esc to interrupt)");
       const s = createMonitorState();
       s.status = 'waiting'; s.waitUntil = Date.now() - 1000; s._waitingViaMenu = false;
       assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'user-continued');
       assert.equal(t._sent.length, 0);
+      assert.equal(s.status, 'monitoring');
+    });
+
+    it('banner gone + attempts exhausted resets to monitoring (never sends past max)', async () => {
+      const t = mockTmux('ordinary output after the reset');
+      const s = createMonitorState();
+      s.status = 'waiting'; s.waitUntil = Date.now() - 1000; s.attempts = DEFAULT_CONFIG.maxRetries;
+      s._gaveUp = true;
+      assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'user-continued');
+      assert.equal(t._sent.length, 0);            // nothing past maxRetries
+      assert.equal(s.status, 'monitoring');       // incident over, clean slate
+      assert.equal(s.attempts, 0);
+      assert.equal(s._gaveUp, false);
     });
   });
 
@@ -853,11 +880,16 @@ describe('processOneTick', () => {
     s.waitUntil = Date.now() - 1000; s.status = 'waiting';
     assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'retried');
   });
-  it('resets counter when rate limit disappears', async () => {
+  it('sends the retry when the banner disappears at expiry, then resets once Claude works', async () => {
+    // Idle pane, no banner: the limit cleared while the session sat parked — send.
     const t = mockTmux('Claude is working normally');
     const s = createMonitorState();
     s.waitUntil = Date.now() - 1000; s.status = 'waiting'; s.attempts = 2;
-    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'user-continued');
+    assert.equal(await processOneTick(s, t, '%0', DEFAULT_CONFIG, () => true), 'retried');
+    assert.equal(t._sent.length, 1);
+    // The retry lands, Claude resumes → the counter resets on the next tick.
+    const t2 = mockTmux('Claude is working normally\n· Doing… (esc to interrupt)');
+    assert.equal(await processOneTick(s, t2, '%0', DEFAULT_CONFIG, () => true), 'user-continued');
     assert.equal(s.attempts, 0);
   });
   it('stops retrying after max attempts and stays in waiting', async () => {

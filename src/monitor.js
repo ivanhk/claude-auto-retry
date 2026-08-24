@@ -335,16 +335,27 @@ export async function processOneTick(state, tmuxAdapter, pane, config, isAlive, 
     // session (and a banner re-printed by another process keeps it "rate-limited" the
     // whole time). Resumed ⇒ the session continued; never inject into it.
     //
-    // But for the MENU path a vanished banner is NOT a human resume — the monitor parked
-    // the session itself, so it must send the retry to resume the turn. Fall through to
-    // the retry send below instead of returning 'user-continued'.
-    if ((limitGone || resumed) && !state._waitingViaMenu) {
+    // A WORKING session is the one case that silences the monitor: the user (or Claude
+    // Code itself) took the pane over, and injecting into it is never right. A VANISHED
+    // banner used to mean "user resumed" too, but a banner that disappears exactly when
+    // the wait expires is the normal end of a correctly-timed wait — the reset passed
+    // while the session sat parked, nobody touched it, and an idle pane is waiting for
+    // exactly one thing: the retry. Returning 'user-continued' there (the old rule) left
+    // every such session idle forever — no banner left to re-detect, no retry sent
+    // (observed across four straight days of logs: "Waiting 9000s… User already
+    // continued" with nothing in between). `resumed` alone now silences; a cleared limit
+    // on an idle pane falls through to the send below, bounded by maxRetries.
+    if (resumed) {
       state.status = 'monitoring'; state.attempts = 0; state._gaveUp = false;
       state._waitIsFallback = false; state._waitingViaMenu = false;
       return 'user-continued';
     }
-    // Menu path: a resumed session still means don't inject (the user took over).
-    if (state._waitingViaMenu && resumed) {
+
+    // Retries exhausted but the banner is GONE: the incident is over. Return to
+    // monitoring with a clean slate (a fresh detection re-enters with a fresh budget) —
+    // the give-up hold below is reserved for a banner that LINGERS, and without this
+    // escape a gave-up monitor would loop max-retries against a healthy idle pane forever.
+    if (state.attempts >= config.maxRetries && limitGone) {
       state.status = 'monitoring'; state.attempts = 0; state._gaveUp = false;
       state._waitIsFallback = false; state._waitingViaMenu = false;
       return 'user-continued';

@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A correctly-timed wait now auto-continues when the limit clears underneath it.** The
+  waiting branch treated a VANISHED banner as "the user already continued" and silently
+  returned to monitoring — but a banner that disappears exactly when the wait expires is
+  the normal end of a correctly-timed wait: the reset passed while the session sat
+  parked, nobody touched it, and the idle pane was waiting for exactly one thing, the
+  retry. Four straight days of live logs showed the failure ("Rate limit detected …
+  Waiting 9000s" → "User already continued", no send in between): the auto-continue
+  never fired and the session idled until manually continued. `resumedAfterLimit`
+  (Claude visibly working) is now the only thing that silences the monitor at expiry; a
+  cleared limit on an idle pane sends, bounded by maxRetries. And retries exhausted with
+  the banner gone now resets to monitoring instead of looping the give-up hold against
+  a healthy idle pane forever.
+
 - **claude-hud's block-gauge usage meters no longer hijack the reset-time parse.** Newer
   claude-hud layouts render the usage state as one bottom row with block gauges —
   `Context ██░░░░░░░░ 16% │ Usage ██░░░░░░░░ 20% (resets in 4h 49m)`, optionally with a
